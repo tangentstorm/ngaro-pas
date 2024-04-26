@@ -1,63 +1,75 @@
-{$i xpc.inc }
+{$mode objfpc}{$i xpc.inc}{$M+}
 unit ng;
-interface uses xpc, stacks, kvm, posix, sysutils;
+interface uses xpc, stacks, kvm, kbd, posix, sysutils, classes;
 
-  type
-    pvm	   = ^vm;
-    token  = string[ 6 ];
-    thunk  = procedure of object;
-    device = function( msg : int32 ) : int32 of object;
-    oprec  = record
-	       go	: thunk;
-	       tok, sig	: token;
-	       hasarg	: boolean;
-	     end;
-    image  = file of int32;
+type
+  token  = string[ 6 ];
+  thunk  = procedure of object;
+  device = function( msg : int32 ) : int32 of object;
+  oprec  = record
+    go        : thunk;
+    tok, sig  : token;
+    hasarg    : boolean;
+  end;
+  TInt32Stack = specialize GStack<Int32>;
 
 { interface > types }
 
-    vm	   = object
-      data, addr : specialize stack< int32 >;
-      ram, ports : array of int32;
-      devices	 : array of device;
-      ip	 : integer;              { instruction pointer }
+  TNgaroVM = class (TComponent)
+    public { !! only because the terminal needs it for some reason }
+      data, addr : TInt32Stack;
       done       : boolean;
-
-      inputs     : array of textfile;    { input files - see ng.input.pas }
+    private
+      ram, ports : array of int32;
+      ip         : integer;           { instruction pointer }
+      inputs     : array of textfile; { input files - see ng.input.pas }
       input      : ^textfile;
+      optbl      : array of oprec;
+      _debug     : boolean;
+      _imgpath   : TStr;
+      _imgsize   : cardinal;
+      _minsize   : cardinal;
+    public
+      devices    : array of device;
+      retroTerm  : kvm.ITerm;
+      debugTerm  : kvm.ITerm;
 
-      optbl	 : array of oprec;
-      imgfile	 : image;
-      imgpath    : string;
-      debugmode  : boolean;
-      padsize    : int32;
-
-      constructor init( imagepath : string; debug : boolean; pad: int32 );
-
+      constructor New(imagepath : TStr);
+      destructor Destroy; override;
       { single-step instructions }
-      procedure tick;
-      procedure runop( op:int32 );
-      procedure runio;
+      procedure Step;
+      procedure RunOp( op:int32 );
+
+      { input/output }
+      procedure RunIO;
+      function Waiting : boolean;
 
       { main loop(s) }
-      procedure loop;
+      procedure Loop;
 
       { input file loader }
-      procedure include( path : string );
+      procedure Include( path : TStr );
 
       { image routines }
-      procedure load;
-      procedure save;
+      procedure Load;
+      procedure Save;
+      procedure SetImgSize( newsize : cardinal );
+      procedure SetMinSize( newsize : cardinal );
 
       { debug / inspect routines }
-      procedure trace;
-      procedure dump;
-      procedure show_debugger( msg : string );
+      procedure Trace;
+      procedure Dump;
+      procedure Show_Debugger( msg : TStr );
+    published
+      property debugmode : boolean read _debug write _debug;
+      property imgpath : TStr read _imgpath write _imgpath;
+      property imgsize : cardinal read _imgsize;
+      property minsize : cardinal read _minsize write SetMinSize;
 
 { continued... }
 
 { interface > type vm = object ... }
-
+    public
   { opcodes, defined in ng.ops.pas }
       procedure oNOP;  procedure oLIT;  procedure oDUP;  procedure oDROP;
       procedure oSWAP; procedure OPUSH; procedure oPOP;  procedure oLOOP;
@@ -71,6 +83,7 @@ interface uses xpc, stacks, kvm, posix, sysutils;
       procedure init_optable;
 
   { port handlers, defined in ng.ports.pas }
+      procedure clear;
       function handle_syncport( msg : int32 ) : int32;
       function handle_keyboard( msg : int32 ) : int32;
       function handle_input( msg : int32 ) : int32;
@@ -84,10 +97,15 @@ interface uses xpc, stacks, kvm, posix, sysutils;
       function handle_eterm( msg : int32 ) : int32;
       procedure init_porthandlers;
 
-  { retro image layout conventions }
-      function rx_getstring( start : int32 ) : string;
-
+   { retro image layout conventions }
+      function rx_getstring( start : int32 ) : TStr;
     end;
+  ENotFinished = class (Exception);
+
+const
+  rxWAITING = 0;
+  rxACTIVE  = 1;
+
 
 implementation
 
@@ -98,62 +116,81 @@ implementation
   {$i ng_ports.pas }
   {$i ng_debug.pas }
 
-  constructor vm.init( imagepath : string; debug : boolean; pad : int32 );
+constructor TNgaroVM.New( imagepath : TStr );
   begin
-    self.padsize := pad;
+    _imgsize := 0;
+    _minsize := 65536;
     self.init_optable;
     assert( length( self.optbl ) >= 31 );
     self.init_porthandlers;
-    self.data.init( 128 );
-    self.addr.init( 128 );
+    self.data := TInt32Stack.Create( 128 );
+    self.addr := TInt32Stack.Create( 128 );
     self.ip := 0;
     self.imgpath := imagepath;
-    assign( self.imgfile, imagepath );
     self.load;
-    self.debugmode := debug;
+    self.debugmode := false;
+    self.ports[0] := rxACTIVE;
+    self.retroTerm := kvm.asTerm;
+    self.debugTerm := kvm.asTerm;
   end; { vm.init }
+
+destructor TNgaroVM.Destroy;
+  begin
+    inherited destroy;
+    self.data.free;
+    self.addr.free;
+  end;
 
 
 { load and save the vm }
 
-  procedure vm.load;
-    var size, i : int32;
+procedure TNgaroVM.Load;
+  var i : int32; f : file of int32;
   begin
     {$i-}
-    reset( self.imgfile );
+    system.assign( f, self.imgpath );
+    reset( f );
     {$i+}
     if ioresult = 0 then begin
-      size := filesize( self.imgfile );
-      // log.debug([ 'image size = ', size, ' cellss' ]);
-      setlength( self.ram, size );
-      // log.debug([ 'ram = array [', low( self.ram ),
-      //             '..', high( self.ram ), ']' ]);
-      for i := 0 to size - 1 do begin
-	read( self.imgfile, self.ram[ i ]);
+      SetImgSize(FileSize(f));
+      //  TODO: ReadBlock
+      for i := 0 to FileSize(f) - 1 do begin
+        read( f, self.ram[ i ]);
       end;
-      close( self.imgfile );
+      close( f );
     end else begin
       writeln( 'error: unable to open ', self.imgpath );
       halt;
     end;
-    if self.padsize > size then setlength( self.ram, self.padsize )
-  end; { vm.load }
+  end;
 
-  procedure vm.save;
-    var size, i : int32;
+procedure TNgaroVM.SetImgSize( newsize : cardinal );
+  begin
+    _imgsize := max(_minsize, newsize);
+    setlength( self.ram, _imgsize );
+  end;
+
+procedure TNgaroVM.SetMinSize( newsize : cardinal );
+  begin
+    _minsize := newsize; setlength( self.ram, min(_imgsize, _minsize));
+  end;
+
+procedure TNgaroVM.Save;
+  var size, i : int32; f: file of int32;
   begin
     size := length( self.ram );
-    rewrite( self.imgfile, 1 );
+    system.assign( f, imgpath );
+    rewrite( f, 1 );
     for i := 0 to size - 1 do begin
-      write( self.imgfile, self.ram[ i ])
+      write( f, self.ram[ i ])
     end;
-    close( self.imgfile );
-  end; { vm.save }
+    close( f );
+  end;
 
 
 { step by step run of the vm }
 
-  procedure vm.tick;
+procedure TNgaroVM.Step;
   begin
     if self.debugmode then show_debugger( '' );
     if ( ip >= low( ram )) and ( ip <= high( ram )) then
@@ -163,18 +200,18 @@ implementation
     end else done := true
   end;
 
-  procedure vm.trace;
-    var log : text;
+procedure TNgaroVM.Trace;
+  var log : text;
   begin
-    assign( log, 'pascal.log' );
+    system.assign( log, 'pascal.log' );
     rewrite( log );
     repeat
       writeln( log, ip, ^_, ram[ ip ], ^_, data.dumps, ^_, addr.dumps );
-      tick
+      step
     until ip >= length( ram );
-  end; { vm.trace }
+  end;
 
-  procedure vm.runop( op: int32 );
+procedure TNgaroVM.RunOp( op: int32 );
   begin
     { TODO : real breakpoints }
     if false { or ( op = 129 ) } and not debugmode then begin
@@ -182,55 +219,65 @@ implementation
     end;
     if op >= length( optbl ) then oIVK { invoke a procedure }
     else if op < 0 then begin
-       show_debugger( 'bad opcode: ' + inttostr( op )); readln; debugmode := true;
+      show_debugger( 'bad opcode: ' + inttostr( op ));
+      readln; debugmode := true;
     end
     else optbl[ op ].go;
   end;
 
-{ run io }
-  {
-  | Ngaro machines connect via ports.                      |
-  | A port is just a normal cell that's writable from both |
-  | inside and outside the machine, much like a usb port.  |
-  |                                                        |
-  | The protocol is:                                       |
-  |                                                        |
-  | - write whatever you want to the ports                 |
-  | - set ports[ 0 ] to 0                                  |
-  | - invoke the 'wait' instruction                        |
-  |                                                        |
-  | - the vm pauses until a device sets port[ 0 ] to 1     |
-  |                                                        |
-  | Note: only one device will trigger on each WAIT, and   |
-  | (at least in this vm and the js one) they will always  |
-  | be executed in order of ascending port numbers.        |
-  |                                                        |
-  | A device will only be triggered when you write a       |
-  | non-zero values to its port.                           |
-  |                                                        |
-  }
-  procedure vm.runio; { triggered by the oWAIT op }
-    var p: int32;
-  begin
-    if ports[ 0 ] = 0 then begin
-      ports[ 0 ] := 1;
-      for p := 0 to length( ports )-1 do begin
-	if ports[ p ] <> 0 then begin
-	  ports[ p ] := devices[ p ]( ports[ p ]);
-	end;
-      end;
-    end;
-  end; { vm.runio }
+{ IO System
+  -------------------------------------------------------------
 
+  The VM communicates with the outside world through a group of
+  virtual ports. These are simply slots in an array, associated with a
+  particular callback function of type:
+
+  function callback( msg : Int32 ) : Int32;
+
+  - from the VM, use the OUT instruction to send data to a port.
+  - [ NOTE: this part is going away ]
+       * set ports[ 0 ] to 0, again via the OUT opcode
+       * invoke the 'wait' opcode, which triggers =runio=, below.
+
+  A device will only be triggered when you write a non-zero values
+  to its port. Only one device will trigger on each WAIT, and they
+  will always be executed in order of ascending port number.
+
+  NOTE:Because only one is port is called per step, the WAIT
+  opcode isn't necessary, and should be removed.
+
+  <I am only keeping it for the time being because I haven't fully
+  tested retro without it.>
+  ------------------------------------------------------------- }
+procedure TNgaroVM.RunIO; { triggered by the oWAIT op }
+  var p: int32 = 1;
+  begin
+    { find the first message }
+    while (p < length( ports )) and (ports[p] = 0) do inc(p);
+    if p < length( ports ) then
+      try
+        ports[ p ] := devices[ p ]( ports[ p ]);
+        ports[ 0 ] := rxACTIVE;
+      except
+        on ENotFinished do ports[ 0 ] := rxWAITING;
+      else
+        writeln('protocol error on port: ', 1);
+        raise
+      end;
+    { waiting could be set directly or triggered by the try..except }
+    if waiting then dec(ip);
+    {TODO: use something besides exceptions for asynchronous
+      requests: probably port 0. }
+    {TODO: design a mechanism for sending non-stack data. }
+  end;
 
 { the top level routine }
 
-procedure vm.loop;
-begin
-  repeat tick until done;
-end; { vm.loop }
+procedure TNgaroVM.Loop;
+  begin
+    repeat step until done
+  end;
 
 
 initialization
-  { nothing to initialize. }
 end.
